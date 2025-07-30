@@ -1,0 +1,5 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "window.title": "DEFI HACK ${dirty}${activeEditorShort}${separator}${rootName}${separator}"
+}

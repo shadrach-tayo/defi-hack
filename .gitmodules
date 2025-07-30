@@ -4,3 +4,9 @@
 [submodule "foundry/lib/limit-order-protocol"]
 	path = foundry/lib/limit-order-protocol
 	url = https://github.com/1inch/limit-order-protocol
+[submodule "foundry/lib/openzeppelin-contracts"]
+	path = foundry/lib/openzeppelin-contracts
+	url = https://github.com/openzeppelin/openzeppelin-contracts
+[submodule "foundry/lib/solidity-utils"]
+	path = foundry/lib/solidity-utils
+	url = https://github.com/1inch/solidity-utils

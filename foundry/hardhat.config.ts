@@ -69,4 +69,4 @@ const config: HardhatUserConfig = {
   // },
 };
 
-export default config;
+module.exports = config;

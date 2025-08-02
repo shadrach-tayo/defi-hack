@@ -5,7 +5,7 @@ import {Test, console2} from "forge-std/Test.sol";
 import {TWAP} from "../src/TWAP.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
-`
+
 contract TWAPTest is Test {
     TWAP public twap;
     ERC20Mock public dai;

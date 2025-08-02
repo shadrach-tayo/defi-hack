@@ -94,8 +94,9 @@ contract TWAP is IPostInteraction, Ownable {
         }
 
         // Check if enough time has passed since the last fill (TWAP logic)
-        uint256 expectedFillTime = window.startTime + (window.interval * _fillCounts[orderHash]);
-        if (block.timestamp < expectedFillTime) {
+        uint256 nextIntervalStart = window.startTime + (window.interval * _fillCounts[orderHash]);
+        uint256 nextIntervalEnd = nextIntervalStart + window.interval;
+        if (block.timestamp < nextIntervalStart || block.timestamp >= nextIntervalEnd) {
             return 0;
         }
 

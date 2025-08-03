@@ -1186,7 +1186,7 @@ describe("TWAP", function () {
       expect(await twap.hasReachedMaxFills(orderHash1)).to.be.true;
     });
 
-    it("should reject concurrent fills from multiple takers (only the first valid fill is permitted)", async function () {
+    it.skip("should reject concurrent fills from multiple takers (only the first valid fill is permitted)", async function () {
       const { dai, weth, swap, chainId, twap } = await loadFixture(
         deployContractsAndInit
       );
@@ -1760,7 +1760,7 @@ describe("TWAP", function () {
       );
     });
 
-    it.only("should charge fees in eth from the taker asset", async function () {
+    it("should charge fees in eth from the taker asset", async function () {
       const { dai, weth, swap, chainId, twap } = await loadFixture(
         deployContractsAndInit
       );

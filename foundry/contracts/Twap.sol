@@ -375,15 +375,8 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
     }
 
     function _takeFees(IOrderMixin.Order calldata order, uint256 takingAmount, bytes calldata extraData) internal {
-        console.log("\n\n _takeFees", extraData.length);
-        console.logBytes(extraData);
-        console.log("fee charge", uint256(uint16(bytes2(extraData))));
-        console.log("fee base", _FEE_BASE);
-        console.log("takingAmount", takingAmount);
         uint256 fee = takingAmount * uint256(uint16(bytes2(extraData))) / _FEE_BASE;
         address feeRecipient = address(bytes20(extraData[2:22]));
-        console.log("fee", fee / 1e18);
-        console.log("feeRecipient", feeRecipient);
 
         address receiver = order.maker.get();
         if (extraData.length > 22) {
@@ -391,7 +384,6 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
         }
 
         bool isEth = order.takerAsset.get() == address(_WETH) && order.makerTraits.unwrapWeth();
-        console.log("isEth", isEth);
 
         if (isEth) {
             if (fee > 0) {
@@ -407,8 +399,6 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
             }
 
             unchecked {
-                console.log("transfer", takingAmount - fee);
-                console.log("receiver", receiver);
                 IERC20(order.takerAsset.get()).safeTransfer(receiver, takingAmount - fee);
             }
         }

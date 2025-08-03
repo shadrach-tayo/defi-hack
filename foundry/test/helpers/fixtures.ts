@@ -1,14 +1,18 @@
 import { constants } from "@1inch/solidity-utils";
 import { ethers } from "hardhat";
-import { Contract } from "ethers";
+import { BaseContract } from "ethers";
+import { TokenMock } from "../../typechain-types/contracts/mocks/TokenMock";
+import { WrappedTokenMock } from "../../typechain-types/contracts/mocks/WrappedTokenMock";
+import { LimitOrderProtocol } from "../../typechain-types/@1inch/limit-order-protocol-contract/contracts/LimitOrderProtocol";
+import { TokenCustomDecimalsMock } from "../../typechain-types/contracts/mocks/TokenCustomDecimalsMock";
 
 interface SwapTokens {
-  dai: Contract;
-  weth: Contract;
-  inch: Contract;
-  swap: Contract;
+  dai: TokenMock;
+  weth: WrappedTokenMock;
+  inch: TokenMock;
+  swap: LimitOrderProtocol;
   chainId: number;
-  usdc: Contract;
+  usdc: TokenCustomDecimalsMock;
 }
 
 async function deploySwapTokens(): Promise<SwapTokens> {
@@ -34,7 +38,7 @@ async function deploySwapTokens(): Promise<SwapTokens> {
   return { dai, weth, inch, swap, chainId, usdc };
 }
 
-async function deploySwap(): Promise<{ swap: Contract }> {
+async function deploySwap(): Promise<{ swap: BaseContract }> {
   const LimitOrderProtocol = await ethers.getContractFactory(
     "LimitOrderProtocol"
   );
@@ -43,7 +47,7 @@ async function deploySwap(): Promise<{ swap: Contract }> {
   return { swap };
 }
 
-async function deployUSDC(): Promise<{ usdc: Contract }> {
+async function deployUSDC(): Promise<{ usdc: BaseContract }> {
   const TokenMock = await ethers.getContractFactory("TokenMock");
   const usdc = await TokenMock.deploy("USDC", "USDC");
   await usdc.waitForDeployment();
@@ -51,7 +55,7 @@ async function deployUSDC(): Promise<{ usdc: Contract }> {
 }
 
 async function deployArbitraryPredicate(): Promise<{
-  arbitraryPredicate: Contract;
+  arbitraryPredicate: BaseContract;
 }> {
   const ArbitraryPredicateMock = await ethers.getContractFactory(
     "ArbitraryPredicateMock"
@@ -61,7 +65,7 @@ async function deployArbitraryPredicate(): Promise<{
   return { arbitraryPredicate };
 }
 
-async function deployUSDT(): Promise<{ usdt: Contract }> {
+async function deployUSDT(): Promise<{ usdt: BaseContract }> {
   const TokenMock = await ethers.getContractFactory("TokenMock");
   const usdt = await TokenMock.deploy("USDT", "USDT");
   await usdt.waitForDeployment();
@@ -69,7 +73,7 @@ async function deployUSDT(): Promise<{ usdt: Contract }> {
 }
 
 async function deploySeriesEpochManager(): Promise<{
-  seriesEpochManager: Contract;
+  seriesEpochManager: BaseContract;
 }> {
   const SeriesEpochManager = await ethers.getContractFactory(
     "SeriesEpochManager"
@@ -80,7 +84,7 @@ async function deploySeriesEpochManager(): Promise<{
 }
 
 async function deployRangeAmountCalculator(): Promise<{
-  rangeAmountCalculator: Contract;
+  rangeAmountCalculator: BaseContract;
 }> {
   const RangeAmountCalculator = await ethers.getContractFactory(
     "RangeAmountCalculator"

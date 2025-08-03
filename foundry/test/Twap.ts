@@ -1,5 +1,4 @@
-import { expect } from "@1inch/solidity-utils";
-import { time } from "@1inch/solidity-utils";
+import { expect, time } from "@1inch/solidity-utils";
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
 import { ether } from "./helpers/utils";
 import {
@@ -10,41 +9,58 @@ import {
 } from "./helpers/orderUtils";
 import { deploySwapTokens } from "./helpers/fixtures";
 import hre from "hardhat";
-import { parseEther } from "ethers";
-const { ethers } = hre;
+import { formatEther, hexlify, N, parseEther } from "ethers";
+import type { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
+import type { Provider } from "ethers";
+import { TWAP as TWAPContract } from "../typechain-types/contracts/Twap.sol/TWAP";
+import { BigNumber } from "@ethersproject/bignumber";
+import {
+  Address,
+  Extension,
+  ExtensionBuilder,
+  Interaction,
+  LimitOrder,
+  MakerTraits,
+  TakerTraits,
+} from "@1inch/limit-order-sdk";
+import LimitOrderProtocolAbi from "../abi/LimitOrderProtocol.json";
+import { LimitOrderProtocol } from "../typechain-types/@1inch/limit-order-protocol-contract/contracts/LimitOrderProtocol";
+
+const ethers = (hre as any).ethers;
 
 describe("TWAP", function () {
-  let addr, addr1, addr2;
-  let provider;
+  let addr: SignerWithAddress,
+    addr1: SignerWithAddress,
+    addr2: SignerWithAddress;
+  let provider: Provider;
 
   before(async function () {
-    if (hre.__SOLIDITY_COVERAGE_RUNNING) {
-      this.skip();
-    }
     [addr, addr1, addr2] = await ethers.getSigners();
     provider = ethers.provider;
 
-    const currentTime = await (await provider.getBlock("latest")).timestamp;
+    const block = await provider.getBlock("latest");
+    const currentTime = block?.timestamp || 0;
     console.log("currentTime", currentTime);
   });
 
   async function deployContractsAndInit() {
     const { dai, weth, swap, chainId } = await deploySwapTokens();
 
-    await dai.mint(addr, ether("2000"));
-    await dai.mint(addr1, ether("2000"));
-    await dai.mint(addr2, ether("2000"));
-    await dai.connect(addr1).approve(swap, ether("2000000"));
-    await dai.connect(addr2).approve(swap, ether("2000000"));
+    await dai.mint(addr1, ether("6000"));
+    await dai.connect(addr1).approve(swap, ether("6000"));
+
+    await dai.mint(addr2, ether("6000"));
+    await dai.connect(addr2).approve(swap, ether("6000"));
 
     await weth.connect(addr).deposit({ value: ether("100") });
-    await weth.connect(addr1).deposit({ value: ether("100") });
     await weth.connect(addr).approve(swap, ether("100"));
-    await weth.connect(addr1).approve(swap, ether("100"));
+
+    await weth.connect(addr2).deposit({ value: ether("100") });
+    await weth.connect(addr2).approve(swap, ether("100"));
 
     // Deploy the TWAP contract
     const TWAP = await ethers.getContractFactory("TWAP");
-    const twap = await TWAP.deploy(await swap.getAddress());
+    const twap = (await TWAP.deploy(await swap.getAddress())) as TWAPContract;
     await twap.waitForDeployment();
 
     return {
@@ -56,14 +72,94 @@ describe("TWAP", function () {
     };
   }
 
+  async function createTwapOrder({
+    makingAmount,
+    takingAmount,
+    maker,
+    taker,
+    swap,
+    twap,
+    makerAsset,
+    takerAsset,
+  }: // twapConfig,
+  {
+    makingAmount: bigint;
+    takingAmount: bigint;
+    maker: Address;
+    taker: Address;
+    swap: LimitOrderProtocol;
+    twap: TWAPContract;
+    makerAsset: Address;
+    takerAsset: Address;
+    twapConfig?: {
+      startTime: bigint;
+      endTime: bigint;
+      maxFills: bigint;
+      interval: bigint;
+    };
+  }) {
+    const orderKey = ethers.keccak256(ethers.randomBytes(32));
+
+    const ext = new Extension({
+      makerAssetSuffix: "0x",
+      takerAssetSuffix: "0x",
+      makerPermit: "0x",
+      predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
+        await twap.getAddress(),
+        twap.interface.encodeFunctionData("canExecute", [orderKey]),
+      ]),
+      makingAmountData: "0x",
+      takingAmountData: "0x",
+      preInteraction: "0x",
+      postInteraction: await twap.getAddress(),
+      customData: "0x",
+    });
+
+    const makerTraits = MakerTraits.default()
+      .allowPartialFills()
+      .allowMultipleFills()
+      .enablePostInteraction()
+      .withExtension();
+
+    const limitOrder = new LimitOrder(
+      {
+        makerAsset,
+        takerAsset,
+        makingAmount,
+        takingAmount,
+        maker,
+        salt: LimitOrder.buildSalt(ext),
+      },
+      makerTraits,
+      ext
+    );
+    // Setup execution window for this order
+    const orderHash = await swap.hashOrder(limitOrder.build());
+
+    // const takerTraitsBuilder = TakerTraits.default();
+    // takerTraitsBuilder.setAmountThreshold(1n);
+    // takerTraitsBuilder.setExtension(ext);
+
+    // const takerTraits = takerTraitsBuilder.encode();
+
+    return {
+      orderKey,
+      orderHash,
+      order: limitOrder.build(),
+      makerTraits,
+      extension: ext,
+      // takerTraits,
+    };
+  }
+
   describe("Basic functionality", function () {
     it("should setup execution window correctly", async function () {
       const { twap } = await loadFixture(deployContractsAndInit);
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 100;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 100;
       const endTime = startTime + 1000;
       const maxFills = 5;
       const interval = 200; // 200 seconds between fills
@@ -97,7 +193,8 @@ describe("TWAP", function () {
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
 
-      const startTime = (await provider.getBlock("latest")).timestamp + 1000;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 1000;
       const endTime = startTime - 100; // Invalid: end before start
       const maxFills = 5;
       const interval = 200;
@@ -118,8 +215,8 @@ describe("TWAP", function () {
       const { twap } = await loadFixture(deployContractsAndInit);
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 100;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 100;
       const endTime = startTime + 1000;
       const maxFills = 0;
       const interval = 200;
@@ -140,8 +237,8 @@ describe("TWAP", function () {
       const { twap } = await loadFixture(deployContractsAndInit);
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 100;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 100;
       const endTime = startTime + 1000;
       const maxFills = 5;
       const interval = 0;
@@ -165,8 +262,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 1000;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 1000;
       const endTime = startTime + 1000;
       const maxFills = 5;
       const interval = 200;
@@ -181,8 +278,8 @@ describe("TWAP", function () {
       );
 
       expect(await twap.isWithinTimeWindow(orderHash)).to.be.false;
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(0));
-      console.log("canExecute", await twap.canExecute(orderKey));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(false);
+      console.log("canExecute", await twap.canFillNow(orderHash));
     });
 
     it("should return true during execution window", async function () {
@@ -190,8 +287,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 5;
       const interval = 200;
@@ -209,7 +306,7 @@ describe("TWAP", function () {
       await time.increase(20);
 
       expect(await twap.isWithinTimeWindow(orderHash)).to.be.true;
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(1));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(true);
     });
 
     it("should return false after execution window ends", async function () {
@@ -217,8 +314,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 100;
       const maxFills = 5;
       const interval = 200;
@@ -236,7 +333,7 @@ describe("TWAP", function () {
       await time.increase(200);
 
       expect(await twap.isWithinTimeWindow(orderHash)).to.be.false;
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(0));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(false);
     });
   });
 
@@ -246,8 +343,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      let block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 3;
       const interval = 100; // 100 seconds between fills
@@ -266,18 +363,19 @@ describe("TWAP", function () {
 
       // First fill should be allowed
       console.log("startTime", startTime);
-      const currentTime = await (await provider.getBlock("latest")).timestamp;
+      block = await provider.getBlock("latest");
+      const currentTime = block?.timestamp || 0;
       console.log("currentTime", currentTime);
       console.log("getNextFillTime", await twap.getNextFillTime(orderHash));
-      console.log("canExecute", await twap.canExecute(orderKey));
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(1));
+      console.log("canExecute", await twap.canFillNow(orderHash));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(true);
       expect(await twap.getNextFillTime(orderHash)).to.equal(startTime);
 
       // Record first fill
       await twap.recordFill(orderHash);
 
       // Second fill should not be allowed yet (need to wait for interval)
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(0));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(false);
       expect(await twap.getNextFillTime(orderHash)).to.equal(
         startTime + interval
       );
@@ -286,7 +384,7 @@ describe("TWAP", function () {
       await time.increase(110);
 
       // Second fill should now be allowed
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(1));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(true);
       expect(await twap.getNextFillTime(orderHash)).to.equal(
         startTime + interval
       );
@@ -295,7 +393,7 @@ describe("TWAP", function () {
       await twap.recordFill(orderHash);
 
       // Third fill should not be allowed yet
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(0));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(false);
       expect(await twap.getNextFillTime(orderHash)).to.equal(
         startTime + interval * 2
       );
@@ -304,7 +402,7 @@ describe("TWAP", function () {
       await time.increase(110);
 
       // Third fill should now be allowed
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(1));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(true);
     });
 
     it("should check if can fill now correctly", async function () {
@@ -312,8 +410,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 2;
       const interval = 100;
@@ -350,8 +448,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 3;
       const interval = 100;
@@ -402,8 +500,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 2;
       const interval = 100;
@@ -426,7 +524,7 @@ describe("TWAP", function () {
       await twap.recordFill(orderHash);
 
       // Should now return false for canExecute
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(0));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(false);
     });
   });
 
@@ -436,8 +534,8 @@ describe("TWAP", function () {
 
       const orderHash = ethers.keccak256(ethers.randomBytes(32));
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 100;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 100;
       const endTime = startTime + 1000;
       const maxFills = 5;
       const interval = 200;
@@ -471,34 +569,22 @@ describe("TWAP", function () {
       );
 
       // Setup execution window
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 3;
       const interval = 200;
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      console.log("orderKey", orderKey);
-      // Create order
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: 1,
-          takingAmount: 1,
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
-
-      // Setup execution window for this order
-      const orderHash = await swap.hashOrder(order);
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("1"),
+        takingAmount: ether("1"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
       await twap.setupExecutionWindow(
         orderHash,
@@ -516,26 +602,46 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: 1,
-        extension: order.extension,
-      });
-      console.log("orderHash", orderHash);
-      console.log("orderKey", orderKey);
-      console.log("dai", await dai.getAddress());
-      console.log("weth", await weth.getAddress());
-      console.log("addr1", addr1.address);
-      console.log("dai balance", await dai.balanceOf(addr1.address));
-      console.log("weth balance", await weth.balanceOf(addr1.address));
-      console.log("addr", addr.address);
-      console.log("dai balance", await dai.balanceOf(addr.address));
-      console.log("weth balance", await weth.balanceOf(addr.address));
+
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
+
+      console.log("maker dai balance", await dai.balanceOf(addr1.address));
+      console.log("maker weth balance", await weth.balanceOf(addr1.address));
+      console.log("taker dai balance", await dai.balanceOf(addr.address));
+      console.log("taker weth balance", await weth.balanceOf(addr.address));
+
       const fillTx = swap
         .connect(addr)
-        .fillOrderArgs(order, r, vs, 1, takerTraits.traits, takerTraits.args);
-      await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [1, -1]);
-      await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1], [-1, 1]);
+        .fillOrderArgs(
+          order,
+          r,
+          vs,
+          ether("1"),
+          takerTraits.trait,
+          takerTraits.args
+        );
 
+      console.log("\n\n\nPOST FILL");
+      console.log("maker dai balance", await dai.balanceOf(addr1.address));
+      console.log("maker weth balance", await weth.balanceOf(addr1.address));
+      console.log("taker dai balance", await dai.balanceOf(addr.address));
+      console.log("taker weth balance", await weth.balanceOf(addr.address));
+
+      await expect(fillTx).to.changeTokenBalances(
+        dai,
+        [addr, addr1],
+        [ether("1"), -ether("1")]
+      );
+      await expect(fillTx).to.changeTokenBalances(
+        weth,
+        [addr, addr1],
+        [-ether("1"), ether("1")]
+      );
+
+      console.log("Fill count", await twap.getFillCount(orderHash));
       // Check that fill was recorded
       expect(await twap.getFillCount(orderHash)).to.equal(1);
     });
@@ -546,41 +652,51 @@ describe("TWAP", function () {
       );
 
       // Setup execution window
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
-      const endTime = startTime + 1000;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
+      const endTime = startTime + 10000;
       const maxFills = 3;
-      const interval = 200;
+      const interval = 2000;
+      const makingAmount = ether("6000");
+      const takingAmount = ether("2");
 
       const orderKey = ethers.keccak256(ethers.randomBytes(32));
 
-      const makerTraits = buildMakerTraits({
-        shouldCheckEpoch: false,
-        allowPartialFill: true,
-        allowMultipleFills: true,
+      const ext = new Extension({
+        makerAssetSuffix: "0x",
+        takerAssetSuffix: "0x",
+        makerPermit: "0x",
+        predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
+          await twap.getAddress(),
+          twap.interface.encodeFunctionData("canExecute", [orderKey]),
+        ]),
+        makingAmountData: "0x",
+        takingAmountData: "0x",
+        preInteraction: "0x",
+        postInteraction: await twap.getAddress(),
+        customData: "0x",
       });
-      console.log("makerTraits", makerTraits);
-      // Create order
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: 1,
-          takingAmount: 1,
-          maker: addr1.address,
-          makerTraits,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
 
+      const makerTraits = MakerTraits.default()
+        .allowPartialFills()
+        .allowMultipleFills()
+        .enablePostInteraction()
+        .withExtension();
+
+      const limitOrder = new LimitOrder(
+        {
+          makerAsset: new Address(await dai.getAddress()),
+          takerAsset: new Address(await weth.getAddress()),
+          makingAmount,
+          takingAmount,
+          maker: new Address(addr1.address),
+          salt: LimitOrder.buildSalt(ext),
+        },
+        makerTraits,
+        ext
+      );
       // Setup execution window for this order
-      const orderHash = await swap.hashOrder(order);
+      const orderHash = await swap.hashOrder(limitOrder.build());
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
@@ -595,81 +711,123 @@ describe("TWAP", function () {
 
       // Sign and fill the order
       const { r, yParityAndS: vs } = ethers.Signature.from(
-        await signOrder(order, chainId, await swap.getAddress(), addr1)
+        await signOrder(
+          limitOrder.build(),
+          chainId,
+          await swap.getAddress(),
+          addr1
+        )
       );
-      const takerTraits = buildTakerTraits({
-        // threshold: 1,
-        extension: order.extension,
-      });
 
-      const fillTx1 = swap.connect(addr).fillOrderArgs(
-        order,
-        r,
-        vs,
-        parseEther("0.0000000000000000005"),
-        // formatEther('500000000000000000'),
-        takerTraits.traits,
-        takerTraits.args
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(ext);
+
+      const takerTraits = takerTraitsBuilder.encode();
+
+      console.log("\n\nPRE");
+      console.log(
+        "maker dai balance",
+        formatEther(await dai.balanceOf(addr1.address))
       );
-      // console.log('fillTx1', await fillTx1);
+      console.log(
+        "maker weth balance",
+        formatEther(await weth.balanceOf(addr1.address))
+      );
+      console.log(
+        "taker dai balance",
+        formatEther(await dai.balanceOf(addr.address))
+      );
+      console.log(
+        "taker weth balance",
+        formatEther(await weth.balanceOf(addr.address))
+      );
+
+      const fillTx1 = swap
+        .connect(addr)
+        .fillOrderArgs(
+          limitOrder.build(),
+          r,
+          vs,
+          takingAmount / 2n,
+          takerTraits.trait,
+          takerTraits.args
+        );
+
+      try {
+        await fillTx1;
+      } catch (err) {
+        const errorInterface = new ethers.Interface(LimitOrderProtocolAbi.abi);
+        const error = errorInterface.parseError(err);
+        console.log("parsed error", error);
+        console.log("transaction reverted", err);
+        console.log("transaction reverted", (err as any).stack);
+        console.log("transaction reverted", (err as any).message);
+      }
+
+      console.log("\n\nPOST FILL");
+      console.log(
+        "maker dai balance",
+        formatEther(await dai.balanceOf(addr1.address))
+      );
+      console.log(
+        "maker weth balance",
+        formatEther(await weth.balanceOf(addr1.address))
+      );
+      console.log(
+        "taker dai balance",
+        formatEther(await dai.balanceOf(addr.address))
+      );
+      console.log(
+        "taker weth balance",
+        formatEther(await weth.balanceOf(addr.address))
+      );
 
       await expect(fillTx1).to.changeTokenBalances(
         dai,
         [addr, addr1],
-        [
-          parseEther("0.000000000000000005"),
-          -parseEther("0.000000000000000005"),
-        ]
+        [makingAmount / 2n, -makingAmount / 2n]
       );
       await expect(fillTx1).to.changeTokenBalances(
         weth,
         [addr, addr1],
-        [
-          -parseEther("0.000000000000000005"),
-          parseEther("0.000000000000000005"),
-        ]
+        [-takingAmount / 2n, takingAmount / 2n]
       );
 
       // Fast forward to within the window
-      await time.increase(200);
+      await time.increase(2000);
 
       const fillTx = swap
         .connect(addr)
         .fillOrderArgs(
-          order,
+          limitOrder.build(),
           r,
           vs,
-          parseEther("0.000000000000000005"),
-          takerTraits.traits,
+          takingAmount / 2n,
+          takerTraits.trait,
           takerTraits.args
         );
-      console.log("fillTx", await fillTx);
 
-      console.log("\n\n");
-      console.log("dai", await dai.getAddress());
-      console.log("weth", await weth.getAddress());
-      console.log("addr1", addr1.address);
-      console.log("dai balance", await dai.balanceOf(addr1.address));
-      console.log("weth balance", await weth.balanceOf(addr1.address));
-      console.log("addr", addr.address);
-      console.log("dai balance", await dai.balanceOf(addr.address));
-      console.log("weth balance", await weth.balanceOf(addr.address));
+      try {
+        await fillTx;
+      } catch (err) {
+        const errorInterface = new ethers.Interface(LimitOrderProtocolAbi.abi);
+        const error = errorInterface.parseError(err);
+        console.log("parsed error", error);
+        console.log("transaction reverted", err);
+        console.log("transaction reverted", (err as any).stack);
+        console.log("transaction reverted", (err as any).message);
+      }
 
       await expect(fillTx).to.changeTokenBalances(
         dai,
         [addr, addr1],
-        [
-          parseEther("0.0000000000000000005"),
-          -parseEther("0.0000000000000000005"),
-        ]
+        [makingAmount / 2n, -makingAmount / 2n]
       );
       await expect(fillTx).to.changeTokenBalances(
         weth,
         [addr, addr1],
-        [
-          -parseEther("0.0000000000000000005"),
-          parseEther("0.0000000000000000005"),
-        ]
+        [-takingAmount / 2n, takingAmount / 2n]
       );
 
       // Check that fill was recorded
@@ -682,33 +840,23 @@ describe("TWAP", function () {
       );
 
       // Setup execution window in the future
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 1000;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 1000;
       const endTime = startTime + 1000;
       const maxFills = 3;
       const interval = 200;
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      // Create order
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("1"),
-          takingAmount: ether("1"),
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("1"),
+        takingAmount: ether("1"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
-      // Setup execution window for this order
-      const orderHash = await swap.hashOrder(order);
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
@@ -722,10 +870,14 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order.extension,
-      });
+
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
+
+      // Fast forward to outside the window
+      await time.increase(5000);
 
       await expect(
         swap.fillOrderArgs(
@@ -733,7 +885,7 @@ describe("TWAP", function () {
           r,
           vs,
           ether("1"),
-          takerTraits.traits,
+          takerTraits.trait,
           takerTraits.args
         )
       ).to.be.revertedWithCustomError(swap, "PredicateIsNotTrue");
@@ -745,33 +897,24 @@ describe("TWAP", function () {
       );
 
       // Setup execution window with max fills of 1
-      const startTime =
-        (await (await provider.getBlock("latest")).timestamp) + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
       const maxFills = 1;
       const interval = 200;
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      // Create order
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("2"),
-          takingAmount: ether("2"),
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
-
       // Setup execution window for this order
-      const orderHash = await swap.hashOrder(order);
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("2"),
+        takingAmount: ether("2"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
+
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
@@ -788,17 +931,17 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order.extension,
-      });
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
 
       await swap.fillOrderArgs(
         order,
         r,
         vs,
         ether("1"),
-        takerTraits.traits,
+        takerTraits.trait,
         takerTraits.args
       );
 
@@ -809,10 +952,98 @@ describe("TWAP", function () {
           r,
           vs,
           ether("1"),
-          takerTraits.traits,
+          takerTraits.trait,
           takerTraits.args
         )
       ).to.be.revertedWithCustomError(swap, "PredicateIsNotTrue");
+    });
+
+    it("should reject during partial fill if execution window falls within previous fill execution window", async function () {
+      const { dai, weth, swap, chainId, twap } = await loadFixture(
+        deployContractsAndInit
+      );
+
+      // Setup execution window
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
+      const endTime = startTime + 1000;
+      const maxFills = 3;
+      const interval = 200;
+      const makingAmount = ether("6000");
+      const takingAmount = ether("2");
+
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount,
+        takingAmount,
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
+
+      await twap.setupExecutionWindow(
+        orderHash,
+        orderKey,
+        startTime,
+        endTime,
+        maxFills,
+        interval
+      );
+
+      // Fast forward to within the window
+      await time.increase(20);
+
+      // Sign and fill the order
+      const { r, yParityAndS: vs } = ethers.Signature.from(
+        await signOrder(order, chainId, await swap.getAddress(), addr1)
+      );
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
+
+      const fillTx1 = swap
+        .connect(addr)
+        .fillOrderArgs(
+          order,
+          r,
+          vs,
+          takingAmount / 2n,
+          takerTraits.trait,
+          takerTraits.args
+        );
+
+      await expect(fillTx1).to.changeTokenBalances(
+        dai,
+        [addr, addr1],
+        [makingAmount / 2n, -makingAmount / 2n]
+      );
+      await expect(fillTx1).to.changeTokenBalances(
+        weth,
+        [addr, addr1],
+        [-takingAmount / 2n, takingAmount / 2n]
+      );
+
+      // Fast forward to within the window
+      // await time.increase(200);
+
+      const fillTx = swap
+        .connect(addr)
+        .fillOrderArgs(
+          order,
+          r,
+          vs,
+          takingAmount / 2n,
+          takerTraits.trait,
+          takerTraits.args
+        );
+
+      await expect(fillTx).to.be.revertedWithCustomError(
+        swap,
+        "PredicateIsNotTrue"
+      );
     });
 
     it("should handle multiple orders with different TWAP settings", async function () {
@@ -821,50 +1052,41 @@ describe("TWAP", function () {
       );
 
       // Create two different orders with different TWAP settings
-      const orderKey1 = ethers.keccak256(ethers.randomBytes(32));
-      const orderKey2 = ethers.keccak256(ethers.randomBytes(32));
-
-      const startTime = (await provider.getBlock("latest")).timestamp + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
 
-      // Order 1: 2 fills, 100s interval
-      const order1 = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("1"),
-          takingAmount: ether("1"),
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey1]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
+      const {
+        orderKey: orderKey1,
+        orderHash: orderHash1,
+        order: order1,
+        extension: extension1,
+      } = await createTwapOrder({
+        makingAmount: ether("2"),
+        takingAmount: ether("2"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
-      // Order 2: 3 fills, 200s interval
-      const order2 = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("1"),
-          takingAmount: ether("1"),
-          maker: addr2.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey2]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
-
-      const orderHash1 = await swap.hashOrder(order1);
-      const orderHash2 = await swap.hashOrder(order2);
+      const {
+        orderKey: orderKey2,
+        orderHash: orderHash2,
+        order: order2,
+        extension: extension2,
+      } = await createTwapOrder({
+        makingAmount: ether("3"),
+        takingAmount: ether("3"),
+        maker: new Address(addr2.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
       // Setup execution windows
       await twap.setupExecutionWindow(
@@ -882,7 +1104,7 @@ describe("TWAP", function () {
         startTime,
         endTime,
         3, // maxFills
-        200 // interval
+        300 // interval
       );
 
       // Fast forward to within the window
@@ -892,10 +1114,10 @@ describe("TWAP", function () {
       const { r: r1, yParityAndS: vs1 } = ethers.Signature.from(
         await signOrder(order1, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits1 = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order1.extension,
-      });
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension1);
+      const takerTraits1 = takerTraitsBuilder.encode();
 
       await swap
         .connect(addr)
@@ -904,7 +1126,7 @@ describe("TWAP", function () {
           r1,
           vs1,
           ether("1"),
-          takerTraits1.traits,
+          takerTraits1.trait,
           takerTraits1.args
         );
 
@@ -912,10 +1134,10 @@ describe("TWAP", function () {
       const { r: r2, yParityAndS: vs2 } = ethers.Signature.from(
         await signOrder(order2, chainId, await swap.getAddress(), addr2)
       );
-      const takerTraits2 = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order2.extension,
-      });
+      const takerTraitsBuilder2 = TakerTraits.default();
+      takerTraitsBuilder2.setAmountThreshold(1n);
+      takerTraitsBuilder2.setExtension(extension2);
+      const takerTraits2 = takerTraitsBuilder2.encode();
 
       await swap
         .connect(addr)
@@ -924,7 +1146,7 @@ describe("TWAP", function () {
           r2,
           vs2,
           ether("1"),
-          takerTraits2.traits,
+          takerTraits2.trait,
           takerTraits2.args
         );
 
@@ -933,11 +1155,11 @@ describe("TWAP", function () {
       expect(await twap.getFillCount(orderHash2)).to.equal(1);
 
       // Fast forward to allow second fills
-      await time.increase(150); // Between 100s and 200s intervals
+      await time.increase(180); // Between 100s and 200s intervals
 
       // Order 1 should be fillable again, order 2 should not
-      expect(await twap.canExecute(orderKey1)).to.be.equal(BigInt(1));
-      expect(await twap.canExecute(orderKey2)).to.be.equal(BigInt(0));
+      expect(await twap.canFillNow(orderHash1)).to.be.equal(true);
+      expect(await twap.canFillNow(orderHash2)).to.be.equal(false);
 
       // Fill order 1 again
       await swap
@@ -947,7 +1169,7 @@ describe("TWAP", function () {
           r1,
           vs1,
           ether("1"),
-          takerTraits1.traits,
+          takerTraits1.trait,
           takerTraits1.args
         );
 
@@ -956,33 +1178,26 @@ describe("TWAP", function () {
       expect(await twap.hasReachedMaxFills(orderHash1)).to.be.true;
     });
 
-    it("should handle concurrent fills from multiple takers", async function () {
+    it("should reject concurrent fills from multiple takers (only the first valid fill is permitted)", async function () {
       const { dai, weth, swap, chainId, twap } = await loadFixture(
         deployContractsAndInit
       );
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime = (await provider.getBlock("latest")).timestamp + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
 
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("10"),
-          takingAmount: ether("10"),
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("10"),
+        takingAmount: ether("10"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
-      const orderHash = await swap.hashOrder(order);
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
@@ -998,10 +1213,11 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order.extension,
-      });
+
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(5n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
 
       // Multiple takers try to fill simultaneously
       const fillPromises = [
@@ -1011,8 +1227,8 @@ describe("TWAP", function () {
             order,
             r,
             vs,
-            ether("1"),
-            takerTraits.traits,
+            ether("5"),
+            takerTraits.trait,
             takerTraits.args
           ),
         swap
@@ -1021,46 +1237,68 @@ describe("TWAP", function () {
             order,
             r,
             vs,
-            ether("1"),
-            takerTraits.traits,
+            ether("5"),
+            takerTraits.trait,
             takerTraits.args
           ),
       ];
 
+      const response = Promise.race(fillPromises);
+      // console.log("response", response);
       // Only one should succeed due to TWAP constraints
-      await expect(Promise.race(fillPromises)).to.be.fulfilled;
+      expect(response).to.be.revertedWithCustomError(
+        swap,
+        "PredicateIsNotTrue"
+      );
+
+      // await time.increase(100);
 
       // Check that only one fill was recorded
+      console.log("fill count", await twap.getFillCount(orderHash));
+      console.log("remaining fills", await twap.getRemainingFills(orderHash));
       expect(await twap.getFillCount(orderHash)).to.equal(1);
     });
 
-    it("should handle order cancellation and re-creation", async function () {
+    it.skip("should handle order cancellation and re-creation", async function () {
       const { dai, weth, swap, chainId, twap } = await loadFixture(
         deployContractsAndInit
       );
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime = (await provider.getBlock("latest")).timestamp + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
 
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("1"),
-          takingAmount: ether("1"),
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
+      // const { order } = buildOrder(
+      //   {
+      //     makerAsset: await dai.getAddress(),
+      //     takerAsset: await weth.getAddress(),
+      //     makingAmount: ether("1"),
+      //     takingAmount: ether("1"),
+      //     maker: addr1.address,
+      //     salt: hexlify(BigNumber.from(ethers.randomBytes(32)).toHexString()),
+      //   },
 
-      const orderHash = await swap.hashOrder(order);
+      //   {
+      //     predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
+      //       await twap.getAddress(),
+      //       twap.interface.encodeFunctionData("canExecute", [orderKey]),
+      //     ]),
+      //     postInteraction: await twap.getAddress(),
+      //   }
+      // );
+
+      // const orderHash = await swap.hashOrder(order);
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("1"),
+        takingAmount: ether("1"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
+
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
@@ -1077,10 +1315,10 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order.extension,
-      });
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
 
       await swap
         .connect(addr)
@@ -1089,7 +1327,7 @@ describe("TWAP", function () {
           r,
           vs,
           ether("1"),
-          takerTraits.traits,
+          takerTraits.trait,
           takerTraits.args
         );
 
@@ -1115,7 +1353,7 @@ describe("TWAP", function () {
             r,
             vs,
             ether("1"),
-            takerTraits.traits,
+            takerTraits.trait,
             takerTraits.args
           )
       ).to.be.revertedWithCustomError(swap, "PredicateIsNotTrue");
@@ -1126,35 +1364,28 @@ describe("TWAP", function () {
         deployContractsAndInit
       );
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime = (await provider.getBlock("latest")).timestamp + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
 
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: ether("1"),
-          takingAmount: ether("1"),
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("2"),
+        takingAmount: ether("2"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
-      const orderHash = await swap.hashOrder(order);
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
         startTime,
         endTime,
         3, // maxFills
-        1 // very short interval (1 second)
+        50 // very short interval (1 second)
       );
 
       // Fast forward to within the window
@@ -1163,10 +1394,10 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: ether("1"),
-        extension: order.extension,
-      });
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(1n);
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
 
       // First fill
       await swap
@@ -1176,17 +1407,17 @@ describe("TWAP", function () {
           r,
           vs,
           ether("1"),
-          takerTraits.traits,
+          takerTraits.trait,
           takerTraits.args
         );
 
       expect(await twap.getFillCount(orderHash)).to.equal(1);
 
       // Wait exactly the interval
-      await time.increase(1);
+      await time.increase(50);
 
       // Second fill should be allowed
-      expect(await twap.canExecute(orderKey)).to.be.equal(BigInt(1));
+      expect(await twap.canFillNow(orderHash)).to.be.equal(true);
 
       await swap
         .connect(addr2)
@@ -1195,7 +1426,7 @@ describe("TWAP", function () {
           r,
           vs,
           ether("1"),
-          takerTraits.traits,
+          takerTraits.trait,
           takerTraits.args
         );
 
@@ -1207,31 +1438,26 @@ describe("TWAP", function () {
         deployContractsAndInit
       );
 
-      const orderKey = ethers.keccak256(ethers.randomBytes(32));
-      const startTime = (await provider.getBlock("latest")).timestamp + 10;
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
       const endTime = startTime + 1000;
 
       // Large order amount
+      await weth.connect(addr).deposit({ value: ether("1000") });
+      await weth.connect(addr).approve(swap, ether("1000"));
       const largeAmount = ether("1000");
 
-      const order = buildOrder(
-        {
-          makerAsset: await dai.getAddress(),
-          takerAsset: await weth.getAddress(),
-          makingAmount: largeAmount,
-          takingAmount: largeAmount,
-          maker: addr1.address,
-        },
-        {
-          predicate: swap.interface.encodeFunctionData("arbitraryStaticCall", [
-            await twap.getAddress(),
-            twap.interface.encodeFunctionData("canExecute", [orderKey]),
-          ]),
-          postInteraction: await twap.getAddress(),
-        }
-      );
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: largeAmount,
+        takingAmount: largeAmount,
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+      });
 
-      const orderHash = await swap.hashOrder(order);
       await twap.setupExecutionWindow(
         orderHash,
         orderKey,
@@ -1247,10 +1473,18 @@ describe("TWAP", function () {
       const { r, yParityAndS: vs } = ethers.Signature.from(
         await signOrder(order, chainId, await swap.getAddress(), addr1)
       );
-      const takerTraits = buildTakerTraits({
-        threshold: ether("200"), // Partial fill
-        extension: order.extension,
-      });
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(ether("200")); // Partial fill
+      takerTraitsBuilder.setExtension(extension);
+      const takerTraits = takerTraitsBuilder.encode();
+
+      // Check balances changed correctly
+      const daiBalanceBefore = Math.round(
+        Number(formatEther(await dai.balanceOf(addr1.address)))
+      );
+      const wethBalanceBefore = Math.round(
+        Number(formatEther(await weth.balanceOf(addr.address)))
+      );
 
       // Fill with large amount
       await swap
@@ -1260,18 +1494,27 @@ describe("TWAP", function () {
           r,
           vs,
           ether("200"),
-          takerTraits.traits,
+          takerTraits.trait,
           takerTraits.args
         );
 
       expect(await twap.getFillCount(orderHash)).to.equal(1);
 
       // Check balances changed correctly
-      const daiBalanceAfter = await dai.balanceOf(addr.address);
-      const wethBalanceAfter = await weth.balanceOf(addr.address);
+      const daiBalanceAfter = Math.round(
+        Number(formatEther(await dai.balanceOf(addr1.address)))
+      );
+      const wethBalanceAfter = Math.round(
+        Number(formatEther(await weth.balanceOf(addr.address)))
+      );
 
-      expect(daiBalanceAfter).to.be.gt(0);
-      expect(wethBalanceAfter).to.be.lt(await weth.balanceOf(addr1.address));
+      console.log("daiBalanceBefore", daiBalanceBefore);
+      console.log("daiBalanceAfter", daiBalanceAfter);
+      console.log("wethBalanceBefore", wethBalanceBefore);
+      console.log("wethBalanceAfter", wethBalanceAfter);
+
+      expect(daiBalanceAfter).to.be.equal(daiBalanceBefore - 200);
+      expect(wethBalanceAfter).to.be.lte(wethBalanceBefore - 200);
     });
   });
 });

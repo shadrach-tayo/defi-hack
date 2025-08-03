@@ -2,16 +2,24 @@
 
 pragma solidity 0.8.23;
 
-import {IPostInteraction} from "@lop/interfaces/IPostInteraction.sol";
+import {IPostInteraction} from "./interfaces/IPostInteraction.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {IOrderMixin} from "@lop/interfaces/IOrderMixin.sol";
+import {IOrderMixin} from "./OrderMixin.sol";
+import {UniERC20} from "@1inch/solidity-utils/contracts/libraries/UniERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+// import {IOrderMixin} from "@1inch/limit-order-protocol-contract/contracts/OrderMixin.sol";
+import "hardhat/console.sol";
 
 /// @title TWAP (Time-Weighted Average Price) predicate contract for scheduled execution windows with fill count tracking
 contract TWAP is IPostInteraction, Ownable {
+    using UniERC20 for IERC20;
+
     error InvalidExecutionWindow();
     error InvalidMaxFills();
     error OrderAlreadyClosed();
     error UnauthorizedCaller();
+    error OrderAlreadySetup();
+    error OrderAlreadyCancelled();
 
     address private _LOP;
 
@@ -29,6 +37,16 @@ contract TWAP is IPostInteraction, Ownable {
     /// @notice Mapping to store orderKey for each orderHash (for reverse lookup)
     mapping(bytes32 => bytes32) private _orderKeyToOrderHash;
 
+    event OrderCreated(
+        bytes32 indexed orderHash,
+        bytes32 indexed orderKey,
+        uint256 startTime,
+        uint256 endTime,
+        uint256 maxFills,
+        uint256 interval
+    );
+    event OrderCancelled(bytes32 indexed orderHash);
+
     struct ExecutionWindow {
         uint256 startTime;
         uint256 endTime;
@@ -36,7 +54,9 @@ contract TWAP is IPostInteraction, Ownable {
         uint256 interval;
     }
 
-    modifier onlyLOP() {
+    modifier onlyLimitOrderProtocol() {
+        console.log("msg.sender", msg.sender);
+        console.log("_LOP", _LOP);
         if (msg.sender != _LOP) revert UnauthorizedCaller();
         _;
     }
@@ -63,11 +83,26 @@ contract TWAP is IPostInteraction, Ownable {
         if (maxFills == 0) revert InvalidMaxFills();
         if (interval == 0) revert InvalidExecutionWindow();
 
+        if (_twapOrders[orderHash]) revert OrderAlreadySetup();
+
         _executionWindows[orderHash] =
             ExecutionWindow({startTime: startTime, endTime: endTime, maxFills: maxFills, interval: interval});
 
         _twapOrders[orderHash] = true;
         _orderKeyToOrderHash[orderKey] = orderHash;
+
+        emit OrderCreated(orderHash, orderKey, startTime, endTime, maxFills, interval);
+    }
+
+    function cancelExecutionWindow(bytes32 orderHash) external returns (bool) {
+        if (!_twapOrders[orderHash]) revert OrderAlreadyCancelled();
+        _executionWindows[orderHash] = ExecutionWindow({startTime: 0, endTime: 0, maxFills: 0, interval: 0});
+        _twapOrders[orderHash] = false;
+        // _orderKeyToOrderHash[orderKey] = bytes32(0);
+
+        emit OrderCancelled(orderHash);
+
+        return true;
     }
 
     function setLOP(address _lop) external onlyOwner {
@@ -77,11 +112,15 @@ contract TWAP is IPostInteraction, Ownable {
     /// @notice Checks if the current time is within the execution window and fill count hasn't been exceeded
     /// @param orderKey The key of the order to check
     /// @return True if the order can be filled, false otherwise
-    function canExecute(bytes32 orderKey) external view returns (uint256) {
+    function canExecute(bytes32 orderKey) external view onlyLimitOrderProtocol returns (uint256) {
         bytes32 orderHash = _orderKeyToOrderHash[orderKey];
+
+        console.log("block.timestamp", block.timestamp);
+
         if (!_twapOrders[orderHash]) return 0;
 
         ExecutionWindow memory window = _executionWindows[orderHash];
+        console.log("is Invalid window", block.timestamp < window.startTime || block.timestamp >= window.endTime);
 
         // Check if current time is within the execution window
         if (block.timestamp < window.startTime || block.timestamp >= window.endTime) {
@@ -96,6 +135,9 @@ contract TWAP is IPostInteraction, Ownable {
         // Check if enough time has passed since the last fill (TWAP logic)
         uint256 nextIntervalStart = window.startTime + (window.interval * _fillCounts[orderHash]);
         uint256 nextIntervalEnd = nextIntervalStart + window.interval;
+        console.log("nextIntervalStart", nextIntervalStart);
+        console.log("nextIntervalEnd", nextIntervalEnd);
+        console.log("is invalid interval", block.timestamp < nextIntervalStart || block.timestamp >= nextIntervalEnd);
         if (block.timestamp < nextIntervalStart || block.timestamp >= nextIntervalEnd) {
             return 0;
         }
@@ -121,7 +163,7 @@ contract TWAP is IPostInteraction, Ownable {
         uint256 takingAmount,
         uint256 remainingMakingAmount,
         bytes calldata extraData
-    ) external onlyLOP {
+    ) external onlyLimitOrderProtocol {
         // Only record fills for TWAP orders
         if (!_twapOrders[orderHash]) return;
 
@@ -129,6 +171,7 @@ contract TWAP is IPostInteraction, Ownable {
         if (_fillCounts[orderHash] >= window.maxFills) revert OrderAlreadyClosed();
 
         _fillCounts[orderHash]++;
+        console.log("postInteraction called", _fillCounts[orderHash]);
     }
 
     /// @notice Records a fill for an order (manual call for testing or external integration)
@@ -251,11 +294,16 @@ contract TWAP is IPostInteraction, Ownable {
         }
 
         // Check if enough time has passed for the next fill
-        uint256 nextFillTime = window.startTime + (window.interval * _fillCounts[orderHash]);
-        return block.timestamp >= nextFillTime;
+        uint256 nextIntervalStart = window.startTime + (window.interval * _fillCounts[orderHash]);
+        uint256 nextIntervalEnd = nextIntervalStart + window.interval;
+        return block.timestamp >= nextIntervalStart && block.timestamp < nextIntervalEnd;
     }
 
     function lop() external view returns (address) {
         return _LOP;
+    }
+
+    function rescueFunds(IERC20 token, address to) external onlyOwner {
+        token.uniTransfer(payable(to), IERC20(token).balanceOf(address(this)));
     }
 }

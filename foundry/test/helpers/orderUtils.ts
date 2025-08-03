@@ -1,8 +1,9 @@
 import { constants, trim0x } from "@1inch/solidity-utils";
 import { assert } from "chai";
-import { keccak256 } from "ethers";
+import { keccak256, toUtf8String, hexlify } from "ethers";
 import { setn } from "./utils";
 import { ethers } from "hardhat";
+import { IOrderMixin } from "../../typechain-types/@1inch/limit-order-protocol-contract/contracts/LimitOrderProtocol";
 
 const Order = [
   { name: "salt", type: "uint256" },
@@ -24,14 +25,14 @@ const ABIOrder = {
 const name = "1inch Limit Order Protocol";
 const version = "4";
 
-const _NO_PARTIAL_FILLS_FLAG = 255n;
-const _ALLOW_MULTIPLE_FILLS_FLAG = 254n;
-const _NEED_PREINTERACTION_FLAG = 252n;
-const _NEED_POSTINTERACTION_FLAG = 251n;
-const _NEED_EPOCH_CHECK_FLAG = 250n;
-const _HAS_EXTENSION_FLAG = 249n;
-const _USE_PERMIT2_FLAG = 248n;
-const _UNWRAP_WETH_FLAG = 247n;
+const _NO_PARTIAL_FILLS_FLAG = 255;
+const _ALLOW_MULTIPLE_FILLS_FLAG = 254;
+const _NEED_PREINTERACTION_FLAG = 252;
+const _NEED_POSTINTERACTION_FLAG = 251;
+const _NEED_EPOCH_CHECK_FLAG = 250;
+const _HAS_EXTENSION_FLAG = 249;
+const _USE_PERMIT2_FLAG = 248;
+const _UNWRAP_WETH_FLAG = 247;
 
 const TakerTraitsConstants = {
   _MAKER_AMOUNT_FLAG: 1n << 255n,
@@ -299,7 +300,7 @@ function buildOrderRFQ(
   }: OrderRFQData = {}
 ): { order: any; signature: string } {
   const order = {
-    salt: ethers.randomBytes(32),
+    salt: "0x" + ethers.randomBytes(32).toString(),
     maker,
     receiver,
     makerAsset,
@@ -351,6 +352,7 @@ interface OrderOptions {
   makingAmount: bigint;
   takingAmount: bigint;
   makerTraits?: bigint;
+  salt?: string;
 }
 
 interface OrderData {
@@ -364,7 +366,6 @@ interface OrderData {
   postInteraction?: string;
   customData?: string;
 }
-
 function buildOrder(
   {
     maker,
@@ -374,6 +375,7 @@ function buildOrder(
     makingAmount,
     takingAmount,
     makerTraits = buildMakerTraits(),
+    salt = "0x0000000000000000000000000000000000000000000000000000000000000000",
   }: OrderOptions,
   {
     makerAssetSuffix = "0x",
@@ -386,9 +388,9 @@ function buildOrder(
     postInteraction = "0x",
     customData = "0x",
   }: OrderData = {}
-): { order: any; signature: string } {
+): { order: IOrderMixin.OrderStruct; signature: string } {
   const order = {
-    salt: ethers.randomBytes(32),
+    salt,
     maker,
     receiver,
     makerAsset,

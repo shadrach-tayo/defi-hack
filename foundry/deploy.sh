@@ -2,6 +2,10 @@
 
 # TWAP Deployment Script
 # This script provides easy deployment commands for the TWAP contract across different networks
+source .env
+echo "PRIVATE_KEY: $PRIVATE_KEY"
+echo "RPC_URL: $RPC_URL"
+echo "NETWORK: $NETWORK"
 
 set -e
 
@@ -44,22 +48,17 @@ check_env() {
 
 # Function to deploy to a specific network
 deploy_to_network() {
-    local network=$1
-    local network_name=$2
-    
-    print_status "Deploying TWAP contract to $network_name..."
-    
-    # Set network environment variable
-    export NETWORK=$network
+    print_status "Deploying TWAP contract..."
     
     # Run the deployment
     forge script script/DeployTwap.sol \
         --rpc-url "$RPC_URL" \
         --private-key "$PRIVATE_KEY" \
         --broadcast \
-        --verify
+        --verify \
+        --via-ir
     
-    print_success "TWAP contract deployed to $network_name"
+    print_success "TWAP contract deployed"
 }
 
 # Function to show usage
@@ -73,12 +72,7 @@ show_usage() {
     echo "  optimism    - Optimism"
     echo "  polygon     - Polygon"
     echo "  bsc         - Binance Smart Chain"
-    echo "  avalanche   - Avalanche"
-    echo "  fantom      - Fantom"
-    echo "  linea       - Linea"
-    echo "  scroll      - Scroll"
-    echo "  mantle      - Mantle"
-    echo "  zksync      - zkSync Era"
+   
     echo ""
     echo "Environment variables:"
     echo "  PRIVATE_KEY - Your private key for deployment"
@@ -131,23 +125,8 @@ main() {
         "bsc")
             deploy_to_network "bsc" "Binance Smart Chain"
             ;;
-        "avalanche")
-            deploy_to_network "avalanche" "Avalanche"
-            ;;
-        "fantom")
-            deploy_to_network "fantom" "Fantom"
-            ;;
-        "linea")
-            deploy_to_network "linea" "Linea"
-            ;;
-        "scroll")
-            deploy_to_network "scroll" "Scroll"
-            ;;
-        "mantle")
-            deploy_to_network "mantle" "Mantle"
-            ;;
-        "zksync")
-            deploy_to_network "zksync" "zkSync Era"
+        "localhost")
+            deploy_to_network "localhost" "Localhost"
             ;;
         *)
             print_error "Unsupported network: $network"

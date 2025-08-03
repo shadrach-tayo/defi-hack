@@ -1,6 +1,6 @@
 import { expect, time } from "@1inch/solidity-utils";
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
-import { ether } from "./helpers/utils";
+import { ether, trim0x } from "./helpers/utils";
 import {
   signOrder,
   buildOrder,
@@ -16,6 +16,7 @@ import { TWAP as TWAPContract } from "../typechain-types/contracts/Twap.sol/TWAP
 import { BigNumber } from "@ethersproject/bignumber";
 import {
   Address,
+  AmountMode,
   Extension,
   ExtensionBuilder,
   Interaction,
@@ -24,7 +25,7 @@ import {
   TakerTraits,
 } from "@1inch/limit-order-sdk";
 import LimitOrderProtocolAbi from "../abi/LimitOrderProtocol.json";
-import { LimitOrderProtocol } from "../typechain-types/@1inch/limit-order-protocol-contract/contracts/LimitOrderProtocol";
+import { LimitOrderProtocol } from "../typechain-types/contracts/LimitOrderProtocol";
 
 const ethers = (hre as any).ethers;
 
@@ -60,7 +61,10 @@ describe("TWAP", function () {
 
     // Deploy the TWAP contract
     const TWAP = await ethers.getContractFactory("TWAP");
-    const twap = (await TWAP.deploy(await swap.getAddress())) as TWAPContract;
+    const twap = (await TWAP.deploy(
+      await swap.getAddress(),
+      await weth.getAddress()
+    )) as TWAPContract;
     await twap.waitForDeployment();
 
     return {
@@ -81,8 +85,8 @@ describe("TWAP", function () {
     twap,
     makerAsset,
     takerAsset,
-  }: // twapConfig,
-  {
+    withFees,
+  }: {
     makingAmount: bigint;
     takingAmount: bigint;
     maker: Address;
@@ -91,14 +95,14 @@ describe("TWAP", function () {
     twap: TWAPContract;
     makerAsset: Address;
     takerAsset: Address;
-    twapConfig?: {
-      startTime: bigint;
-      endTime: bigint;
-      maxFills: bigint;
-      interval: bigint;
+    withFees?: {
+      fee: number;
+      feeRecipient: string;
+      receiver?: Address;
     };
   }) {
     const orderKey = ethers.keccak256(ethers.randomBytes(32));
+    const twapAddress = await twap.getAddress();
 
     const ext = new Extension({
       makerAssetSuffix: "0x",
@@ -108,10 +112,19 @@ describe("TWAP", function () {
         await twap.getAddress(),
         twap.interface.encodeFunctionData("canExecute", [orderKey]),
       ]),
-      makingAmountData: "0x",
-      takingAmountData: "0x",
+      makingAmountData: "0x", // withFees ? await twap.getAddress() : "0x",
+      takingAmountData: "0x", // withFees ? await twap.getAddress() : "0x",
       preInteraction: "0x",
-      postInteraction: await twap.getAddress(),
+      postInteraction:
+        twapAddress +
+        (withFees
+          ? trim0x(
+              ethers.solidityPacked(
+                ["uint16", "address"],
+                [withFees.fee, withFees.feeRecipient]
+              )
+            )
+          : ""),
       customData: "0x",
     });
 
@@ -119,7 +132,8 @@ describe("TWAP", function () {
       .allowPartialFills()
       .allowMultipleFills()
       .enablePostInteraction()
-      .withExtension();
+      .withExtension()
+      .enableNativeUnwrap();
 
     const limitOrder = new LimitOrder(
       {
@@ -129,6 +143,7 @@ describe("TWAP", function () {
         takingAmount,
         maker,
         salt: LimitOrder.buildSalt(ext),
+        receiver: withFees?.receiver ? withFees.receiver : undefined,
       },
       makerTraits,
       ext
@@ -136,19 +151,12 @@ describe("TWAP", function () {
     // Setup execution window for this order
     const orderHash = await swap.hashOrder(limitOrder.build());
 
-    // const takerTraitsBuilder = TakerTraits.default();
-    // takerTraitsBuilder.setAmountThreshold(1n);
-    // takerTraitsBuilder.setExtension(ext);
-
-    // const takerTraits = takerTraitsBuilder.encode();
-
     return {
       orderKey,
       orderHash,
       order: limitOrder.build(),
       makerTraits,
       extension: ext,
-      // takerTraits,
     };
   }
 
@@ -1515,6 +1523,385 @@ describe("TWAP", function () {
 
       expect(daiBalanceAfter).to.be.equal(daiBalanceBefore - 200);
       expect(wethBalanceAfter).to.be.lte(wethBalanceBefore - 200);
+    });
+  });
+
+  describe("TWAP with fees", async function () {
+    it("should charge zero fees from the taker asset", async function () {
+      const { dai, weth, swap, chainId, twap } = await loadFixture(
+        deployContractsAndInit
+      );
+
+      // Setup execution window
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
+      const endTime = startTime + 3600;
+      const maxFills = 3;
+      const interval = 1200;
+
+      const fee = 0;
+      const feeRecipient = await twap.getAddress();
+
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount: ether("10"),
+        takingAmount: ether("10"),
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+        withFees: {
+          fee,
+          feeRecipient,
+          receiver: new Address(await twap.getAddress()),
+        },
+      });
+
+      await twap.setupExecutionWindow(
+        orderHash,
+        orderKey,
+        startTime,
+        endTime,
+        maxFills,
+        interval
+      );
+
+      // Fast forward to within the window
+      await time.increase(20);
+
+      // Sign and fill the order
+      const { r, yParityAndS: vs } = ethers.Signature.from(
+        await signOrder(order, chainId, await swap.getAddress(), addr1)
+      );
+
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(10n);
+      takerTraitsBuilder.setExtension(extension);
+      // takerTraitsBuilder.setAmountMode(AmountMode.taker);
+      // takerTraitsBuilder.
+      const takerTraits = takerTraitsBuilder.encode();
+
+      console.log("maker dai balance", await dai.balanceOf(addr1.address));
+      console.log("maker weth balance", await weth.balanceOf(addr1.address));
+      console.log("taker dai balance", await dai.balanceOf(addr.address));
+      console.log("taker weth balance", await weth.balanceOf(addr.address));
+
+      const fillTx = swap
+        .connect(addr)
+        .fillOrderArgs(
+          order,
+          r,
+          vs,
+          ether("10"),
+          takerTraits.trait,
+          takerTraits.args
+        );
+
+      console.log("\n\n\nPOST FILL");
+      console.log("maker dai balance", await dai.balanceOf(addr1.address));
+      console.log("maker weth balance", await weth.balanceOf(addr1.address));
+      console.log("taker dai balance", await dai.balanceOf(addr.address));
+      console.log("taker weth balance", await weth.balanceOf(addr.address));
+
+      await expect(fillTx).to.changeTokenBalances(
+        dai,
+        [addr, addr1],
+        [ether("10"), -ether("10")]
+      );
+      await expect(fillTx).to.changeTokenBalances(
+        weth,
+        [addr, addr1],
+        [-ether("10"), ether("10")]
+      );
+
+      console.log("Fill count", await twap.getFillCount(orderHash));
+      // Check that fill was recorded
+      expect(await twap.getFillCount(orderHash)).to.equal(1);
+    });
+
+    it("should charge fees in weth from the taker asset", async function () {
+      const { dai, weth, swap, chainId, twap } = await loadFixture(
+        deployContractsAndInit
+      );
+
+      // Setup execution window
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
+      const endTime = startTime + 3600;
+      const maxFills = 3;
+      const interval = 1200;
+
+      const makingAmount = ether("10");
+      const takingAmount = ether("10");
+
+      console.log("\n\nMaker", addr1.address);
+      console.log("Taker", addr.address);
+
+      const fee = 1e4;
+      const feeBase = 1e6;
+      const calculatedFee = (takingAmount * BigInt(fee)) / BigInt(feeBase);
+      console.log("calculatedFee", formatEther(calculatedFee));
+      const feeRecipient = await twap.getAddress();
+
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount,
+        takingAmount,
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+        withFees: {
+          fee,
+          feeRecipient,
+          receiver: new Address(await twap.getAddress()),
+        },
+      });
+
+      await twap.setupExecutionWindow(
+        orderHash,
+        orderKey,
+        startTime,
+        endTime,
+        maxFills,
+        interval
+      );
+
+      // Fast forward to within the window
+      await time.increase(20);
+
+      // Sign and fill the order
+      const { r, yParityAndS: vs } = ethers.Signature.from(
+        await signOrder(order, chainId, await swap.getAddress(), addr1)
+      );
+
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(10n);
+      takerTraitsBuilder.setExtension(extension);
+      // takerTraitsBuilder.setAmountMode(AmountMode.taker);
+      // takerTraitsBuilder.
+      const takerTraits = takerTraitsBuilder.encode();
+
+      console.log(
+        "\n\n\n maker dai balance",
+        formatEther(await dai.balanceOf(addr1.address))
+      );
+      console.log(
+        "maker weth balance",
+        formatEther(await weth.balanceOf(addr1.address))
+      );
+      console.log(
+        "taker dai balance",
+        formatEther(await dai.balanceOf(addr.address))
+      );
+      console.log(
+        "taker weth balance",
+        formatEther(await weth.balanceOf(addr.address))
+      );
+
+      const twapAddress = await twap.getAddress();
+      const twapWethBalance = await weth.balanceOf(twapAddress);
+      console.log("\n\n\n twap weth balance", formatEther(twapWethBalance));
+
+      const fillTx = swap
+        .connect(addr)
+        .fillOrderArgs(
+          order,
+          r,
+          vs,
+          ether("10"),
+          takerTraits.trait,
+          takerTraits.args
+        );
+
+      await fillTx;
+
+      const twapWethBalanceAfter = await weth.balanceOf(twapAddress);
+      console.log(
+        "\n\n\n twap weth balance",
+        formatEther(twapWethBalanceAfter)
+      );
+      console.log("Receiver", addr1.address);
+      // expect(twapWethBalanceAfter).to.be.equal(twapWethBalance + calculatedFee);
+
+      await expect(fillTx).to.changeTokenBalances(
+        dai,
+        [addr, addr1],
+        [makingAmount, -makingAmount]
+      );
+      await expect(fillTx).to.changeTokenBalances(
+        weth,
+        [addr, addr1, twapAddress],
+        [-takingAmount, takingAmount - calculatedFee, calculatedFee]
+      );
+
+      console.log("Fill count", await twap.getFillCount(orderHash));
+      // Check that fill was recorded
+      expect(await twap.getFillCount(orderHash)).to.equal(1);
+
+      console.log("\n\n\nPOST FILL");
+      console.log(
+        "maker dai balance",
+        formatEther(await dai.balanceOf(addr1.address))
+      );
+      console.log(
+        "maker weth balance",
+        formatEther(await weth.balanceOf(addr1.address))
+      );
+      console.log(
+        "taker dai balance",
+        formatEther(await dai.balanceOf(addr.address))
+      );
+      console.log(
+        "taker weth balance",
+        formatEther(await weth.balanceOf(addr.address))
+      );
+    });
+
+    it.only("should charge fees in eth from the taker asset", async function () {
+      const { dai, weth, swap, chainId, twap } = await loadFixture(
+        deployContractsAndInit
+      );
+
+      // Setup execution window
+      const block = await provider.getBlock("latest");
+      const startTime = (block?.timestamp || 0) + 10;
+      const endTime = startTime + 3600;
+      const maxFills = 3;
+      const interval = 1200;
+
+      const makingAmount = ether("10");
+      const takingAmount = ether("10");
+
+      console.log("\n\nMaker", addr1.address);
+      console.log("Taker", addr.address);
+
+      const fee = 1e4;
+      const feeBase = 1e6;
+      const calculatedFee = (takingAmount * BigInt(fee)) / BigInt(feeBase);
+      console.log("calculatedFee", formatEther(calculatedFee));
+      const feeRecipient = await twap.getAddress();
+
+      const { orderKey, orderHash, order, extension } = await createTwapOrder({
+        makingAmount,
+        takingAmount,
+        maker: new Address(addr1.address),
+        taker: new Address(addr.address),
+        swap,
+        twap,
+        makerAsset: new Address(await dai.getAddress()),
+        takerAsset: new Address(await weth.getAddress()),
+        withFees: {
+          fee,
+          feeRecipient,
+          receiver: new Address(await twap.getAddress()),
+        },
+      });
+
+      await twap.setupExecutionWindow(
+        orderHash,
+        orderKey,
+        startTime,
+        endTime,
+        maxFills,
+        interval
+      );
+
+      // Fast forward to within the window
+      await time.increase(20);
+
+      // Sign and fill the order
+      const { r, yParityAndS: vs } = ethers.Signature.from(
+        await signOrder(order, chainId, await swap.getAddress(), addr1)
+      );
+
+      const takerTraitsBuilder = TakerTraits.default();
+      takerTraitsBuilder.setAmountThreshold(10n);
+      takerTraitsBuilder.setExtension(extension);
+      // takerTraitsBuilder.setAmountMode(AmountMode.taker);
+      // takerTraitsBuilder.
+      const takerTraits = takerTraitsBuilder.encode();
+
+      console.log(
+        "\n\n\n maker dai balance",
+        formatEther(await dai.balanceOf(addr1.address))
+      );
+      console.log(
+        "maker weth balance",
+        formatEther(await weth.balanceOf(addr1.address))
+      );
+      console.log(
+        "taker dai balance",
+        formatEther(await dai.balanceOf(addr.address))
+      );
+      console.log(
+        "taker weth balance",
+        formatEther(await weth.balanceOf(addr.address))
+      );
+
+      const twapAddress = await twap.getAddress();
+      const twapWethBalance = await weth.balanceOf(twapAddress);
+      console.log("\n\n\n twap weth balance", formatEther(twapWethBalance));
+
+      const fillTx = swap
+        .connect(addr)
+        .fillOrderArgs(
+          order,
+          r,
+          vs,
+          ether("10"),
+          takerTraits.trait,
+          takerTraits.args
+        );
+
+      await fillTx;
+
+      const twapWethBalanceAfter = await weth.balanceOf(twapAddress);
+      console.log(
+        "\n\n\n twap weth balance",
+        formatEther(twapWethBalanceAfter)
+      );
+      console.log("Receiver", addr1.address);
+      // expect(twapWethBalanceAfter).to.be.equal(twapWethBalance + calculatedFee);
+
+      await expect(fillTx).to.changeTokenBalances(
+        dai,
+        [addr, addr1],
+        [makingAmount, -makingAmount]
+      );
+      await expect(fillTx).to.changeTokenBalances(
+        weth,
+        [addr],
+        [-takingAmount]
+      );
+      await expect(fillTx).to.changeEtherBalances(
+        [addr1, twapAddress],
+        [takingAmount - calculatedFee, calculatedFee]
+      );
+
+      console.log("Fill count", await twap.getFillCount(orderHash));
+      // Check that fill was recorded
+      expect(await twap.getFillCount(orderHash)).to.equal(1);
+
+      console.log("\n\n\nPOST FILL");
+      console.log(
+        "maker dai balance",
+        formatEther(await dai.balanceOf(addr1.address))
+      );
+      console.log(
+        "maker weth balance",
+        formatEther(await weth.balanceOf(addr1.address))
+      );
+      console.log(
+        "taker dai balance",
+        formatEther(await dai.balanceOf(addr.address))
+      );
+      console.log(
+        "taker weth balance",
+        formatEther(await weth.balanceOf(addr.address))
+      );
     });
   });
 });

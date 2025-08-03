@@ -27,7 +27,7 @@ if (getNetwork().indexOf("zksync") !== -1) {
 }
 
 const { networks, etherscan } = new Networks().registerAll();
-
+console.log(networks);
 const config: HardhatUserConfig = {
   etherscan,
   solidity: {
@@ -43,7 +43,20 @@ const config: HardhatUserConfig = {
       viaIR: true,
     },
   },
-  networks,
+  networks: {
+    ...networks,
+    // mainnet: {
+    //   chainId: 1,
+    //   url: process.env.MAINNET_RPC_URL,
+    //   accounts: [
+    //     process.env.PRIVATE_KEY!,
+    //     process.env.RESOLVER_PRIVATE_KEY!,
+    //     process.env.MAKER_PRIVATE_KEY!,
+    //   ],
+    //   gas: 10000000,
+    //   gasPrice: 10000000000,
+    // },
+  },
   namedAccounts: {
     deployer: {
       default: 0,

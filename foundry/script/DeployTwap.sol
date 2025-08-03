@@ -7,6 +7,7 @@ import {TWAP} from "../src/Twap.sol";
 import {WrappedTokenMock} from "../contracts/mocks/WrappedTokenMock.sol";
 import {LimitOrderProtocol} from "@lop/LimitOrderProtocol.sol";
 import {IWETH} from "@1inch/solidity-utils/contracts/interfaces/IWETH.sol";
+import {TokenMock} from "../contracts/mocks/TokenMock.sol";
 
 /// @title TWAP Deployment Script
 /// @notice Configurable deployment script for TWAP contract across multiple EVM chains
@@ -37,7 +38,21 @@ contract DeployTwap is Script {
 
     /// @notice Deploy TWAP contract with network-specific configuration
     function deploy() public returns (TWAP) {
-        if (block.chainid == 31337) {
+        if (block.chainid == 31337 || block.chainid == 1337) {
+            vm.startBroadcast();
+            TokenMock dai = new TokenMock("DAI", "DAI");
+            // _daiAddresses[block.chainid] = address(dai);
+            vm.stopBroadcast();
+
+            console.log("DAI address:", address(dai));
+
+            vm.startBroadcast();
+            TokenMock usdc = new TokenMock("USDC", "USDC");
+            // _usdcAddresses[block.chainid] = address(usdc);
+            vm.stopBroadcast();
+
+            console.log("USDC address:", address(usdc));
+
             vm.startBroadcast();
             WrappedTokenMock weth = new WrappedTokenMock("WETH", "WETH");
             _wethAddresses[block.chainid] = address(weth);

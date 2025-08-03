@@ -15,7 +15,7 @@ import {IERC20, SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeE
 // import {IOrderMixin} from "@1inch/limit-order-protocol-contract/contracts/OrderMixin.sol";
 import {IOrderMixin} from "@1inch/limit-order-protocol-contract/contracts/interfaces/IOrderMixin.sol";
 import {IAmountGetter} from "@1inch/limit-order-protocol-contract/contracts/interfaces/IAmountGetter.sol";
-import "hardhat/console.sol";
+// import "hardhat/console.sol";
 
 /// @title TWAP (Time-Weighted Average Price) predicate contract for scheduled execution windows with fill count tracking
 contract TWAP is IPostInteraction, IAmountGetter, Ownable {
@@ -98,8 +98,6 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
         uint256 remainingMakingAmount,
         bytes calldata extraData
     ) external view returns (uint256) {
-        console.log("getMakingAmount::takingAmount", takingAmount);
-        console.log("getMakingAmount::remainingMakingAmount", remainingMakingAmount);
         return remainingMakingAmount;
     }
 
@@ -122,8 +120,6 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
         uint256 remainingMakingAmount,
         bytes calldata extraData
     ) external view returns (uint256) {
-        console.log("getTakingAmount::makingAmount", makingAmount);
-        console.log("getTakingAmount::remainingMakingAmount", remainingMakingAmount);
         return remainingMakingAmount;
     }
 
@@ -177,12 +173,9 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
     function canExecute(bytes32 orderKey) external view onlyLimitOrderProtocol returns (uint256) {
         bytes32 orderHash = _orderKeyToOrderHash[orderKey];
 
-        // console.log("block.timestamp", block.timestamp);
-
         if (!_twapOrders[orderHash]) return 0;
 
         ExecutionWindow memory window = _executionWindows[orderHash];
-        // console.log("is Invalid window", block.timestamp < window.startTime || block.timestamp >= window.endTime);
 
         // Check if current time is within the execution window
         if (block.timestamp < window.startTime || block.timestamp >= window.endTime) {
@@ -197,9 +190,7 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
         // Check if enough time has passed since the last fill (TWAP logic)
         uint256 nextIntervalStart = window.startTime + (window.interval * _fillCounts[orderHash]);
         uint256 nextIntervalEnd = nextIntervalStart + window.interval;
-        // console.log("nextIntervalStart", nextIntervalStart);
-        // console.log("nextIntervalEnd", nextIntervalEnd);
-        // console.log("is invalid interval", block.timestamp < nextIntervalStart || block.timestamp >= nextIntervalEnd);
+
         if (block.timestamp < nextIntervalStart || block.timestamp >= nextIntervalEnd) {
             return 0;
         }
@@ -233,7 +224,6 @@ contract TWAP is IPostInteraction, IAmountGetter, Ownable {
         if (_fillCounts[orderHash] >= window.maxFills) revert OrderAlreadyClosed();
 
         _fillCounts[orderHash]++;
-        console.log("\n postInteraction called", _fillCounts[orderHash]);
 
         // take fees from
         if (extraData.length > 0) {

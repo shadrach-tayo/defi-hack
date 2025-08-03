@@ -86,6 +86,9 @@ describe("TWAP", function () {
     makerAsset,
     takerAsset,
     withFees,
+    expiration,
+    unwrapWeth,
+    allowedSender,
   }: {
     makingAmount: bigint;
     takingAmount: bigint;
@@ -95,6 +98,9 @@ describe("TWAP", function () {
     twap: TWAPContract;
     makerAsset: Address;
     takerAsset: Address;
+    expiration?: bigint;
+    unwrapWeth?: boolean;
+    allowedSender?: Address;
     withFees?: {
       fee: number;
       feeRecipient: string;
@@ -128,12 +134,23 @@ describe("TWAP", function () {
       customData: "0x",
     });
 
-    const makerTraits = MakerTraits.default()
+    let makerTraits = MakerTraits.default()
       .allowPartialFills()
       .allowMultipleFills()
       .enablePostInteraction()
-      .withExtension()
-      .enableNativeUnwrap();
+      .withExtension();
+
+    if (unwrapWeth) {
+      makerTraits = makerTraits.enableNativeUnwrap();
+    }
+
+    if (expiration) {
+      makerTraits = makerTraits.withExpiration(expiration);
+    }
+
+    if (allowedSender) {
+      makerTraits = makerTraits.withAllowedSender(allowedSender);
+    }
 
     const limitOrder = new LimitOrder(
       {
@@ -592,6 +609,7 @@ describe("TWAP", function () {
         twap,
         makerAsset: new Address(await dai.getAddress()),
         takerAsset: new Address(await weth.getAddress()),
+        expiration: BigInt(endTime),
       });
 
       await twap.setupExecutionWindow(
@@ -1798,6 +1816,9 @@ describe("TWAP", function () {
           feeRecipient,
           receiver: new Address(await twap.getAddress()),
         },
+        unwrapWeth: true,
+        allowedSender: new Address(addr.address),
+        expiration: BigInt(endTime),
       });
 
       await twap.setupExecutionWindow(
